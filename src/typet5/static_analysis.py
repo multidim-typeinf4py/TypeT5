@@ -6,6 +6,7 @@ import enum
 from functools import cache, cached_property, lru_cache
 
 from libcst import MetadataWrapper
+from libcst._metadata_dependent import LazyValue
 from libcst.metadata import (
     CodeRange,
     PositionProvider,
@@ -1080,7 +1081,7 @@ class ModuleAnlaysis:
         self.module = mod
         wrapper = cst.MetadataWrapper(mod.tree, unsafe_skip_copy=True)
         # below need to be dict to be pickleable
-        self.node2qnames = {k: v() for k, v in wrapper.resolve(QualifiedNameProvider).items()}
+        self.node2qnames = {k: (v() if isinstance(v, LazyValue) else v) for k, v in wrapper.resolve(QualifiedNameProvider).items()}
         self.node2pos = dict(wrapper.resolve(PositionProvider))
 
     def compute_module_usages(self):
