@@ -1097,7 +1097,8 @@ class ModuleAnlaysis:
             match e:
                 case PythonFunction():
                     e.tree.visit(recorder)
-                    self_names = self.node2qnames[e.tree.name]
+                    if isinstance(self_names := self.node2qnames[e.tree.name], LazyValue):
+                        self_names = self_names()
 
                     # generate fixture usages
                     if e.is_fixture_user:
