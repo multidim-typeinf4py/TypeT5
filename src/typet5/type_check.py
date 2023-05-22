@@ -3,6 +3,7 @@ import multiprocessing
 import re
 import shutil
 import subprocess
+from typing import Optional, Union
 
 from .utils import *
 
@@ -16,20 +17,19 @@ class PythonType:
         h = ".".join(self.head)
         out: str
         if h.startswith("<"):
-            match h:
-                case "<List>":
-                    out = f"[{', '.join(map(str, self.args))}]"
-                case "<|>":
-                    out = " | ".join(map(str, self.args))
-                case "<FuncCall>":
-                    out = "_FuncCall_"
-                case "<Tuple>":
-                    if len(self.args) == 1:
-                        out = f"({str(self.args[0])},)"
-                    else:
-                        out = f"({', '.join(map(str, self.args))})"
-                case _:
-                    raise ValueError(f"Don't know how to handle special head: '{h}'")
+            if h == "<List>":
+                out = f"[{', '.join(map(str, self.args))}]"
+            elif h == "<|>":
+                out = " | ".join(map(str, self.args))
+            elif h == "<FuncCall>":
+                out = "_FuncCall_"
+            elif h == "<Tuple>":
+                if len(self.args) == 1:
+                    out = f"({str(self.args[0])},)"
+                else:
+                    out = f"({', '.join(map(str, self.args))})"
+            else:
+                raise ValueError(f"Don't know how to handle special head: '{h}'")
         elif len(self.args) == 0:
             out = h
         else:
@@ -183,7 +183,7 @@ def parse_type_str(typ_str: str) -> PythonType:
     return parse_type_from_ast(tree)
 
 
-def parse_type_expr(annot: cst.BaseExpression, silent=True) -> PythonType | None:
+def parse_type_expr(annot: cst.BaseExpression, silent=True) -> Optional[PythonType]:
     code = show_expr(annot, quoted=False)
     code = re.sub(r"#.*\n", "", code).replace("\n", "")
     try:
@@ -198,47 +198,62 @@ def parse_type_expr(annot: cst.BaseExpression, silent=True) -> PythonType | None
 
 def parse_type_from_ast(tree: ast.expr) -> PythonType:
     assert isinstance(tree, ast.expr)
-    match tree:
-        case ast.Name() | ast.Attribute():
-            return PythonType(parse_qualified_name(tree))
-        case ast.Constant(value=str() as s):
-            ty = parse_type_from_ast(ast.parse(s, mode="eval").body)
+    if isinstance(tree, (ast.Name, ast.Attribute)):
+        return PythonType(parse_qualified_name(tree))
+    elif isinstance(tree, ast.Constant):
+        v = tree.value
+        if isinstance(v, str):
+            ty = parse_type_from_ast(ast.parse(v, mode="eval").body)
             return ty
-        case ast.Constant(value=v):
-            if v == None:
-                return PythonType(("None",))
-            elif v == (...):
-                return PythonType(("...",))
-            else:
-                return PythonType((str(v),))
-        case ast.List(elts=elts):  # this can happen inside Callable
-            args = tuple(map(parse_type_from_ast, elts))
-            return PythonType(("<List>",), args)
-        case ast.Subscript(value=(ast.Attribute() | ast.Name()) as v, slice=slice):
-            head = parse_qualified_name(v)
-            if head[-1] == "Literal":
-                return PythonType(head)  # discard the parameters
-            match slice:
-                case ast.Tuple(elts=elts):
-                    args = tuple(map(parse_type_from_ast, elts))
-                case _:
-                    args = (parse_type_from_ast(slice),)
-            return PythonType(head, args)
-        case ast.BinOp(left=left, right=right, op=ast.BitOr()):
-            return PythonType(
-                ("<|>",), (parse_type_from_ast(left), parse_type_from_ast(right))
-            )
-        case ast.Call():
-            return PythonType(("<FuncCall>",))
-        case ast.Tuple(elts=elts):
-            return PythonType(("<Tuple>",), tuple(map(parse_type_from_ast, elts)))
-        case _:
-            raise SyntaxError(
-                f"Unsupported ast type: {ast.dump(tree, include_attributes=True)}"
-            )
+        elif v is None:
+            return PythonType(("None",))
+        elif v == ...:
+            return PythonType(("...",))
+        else:
+            return PythonType((str(v),))
+
+    elif isinstance(tree, ast.List):
+        args = tuple(map(parse_type_from_ast, tree.elts))
+        return PythonType(("<List>",), args)
+
+    elif isinstance(tree, ast.Subscript) and isinstance(
+        tree.value, (ast.Attribute, ast.Name)
+    ):
+        v = tree.value
+        s = tree.slice
+
+        head = parse_qualified_name(v)
+        if head[-1] == "Literal":
+            return PythonType(head)  # discard the parameters
+
+        if isinstance(s, ast.Tuple):
+            args = tuple(map(parse_type_from_ast, s.elts))
+        else:
+            args = (parse_type_from_ast(s),)
+        return PythonType(head, args)
+
+    elif isinstance(tree, ast.BinOp) and isinstance(tree.op, ast.BitOr):
+        left = tree.left
+        right = tree.right
+
+        return PythonType(
+            ("<|>",), (parse_type_from_ast(left), parse_type_from_ast(right))
+        )
+
+    elif isinstance(tree, ast.Call):
+        return PythonType(("<FuncCall>",))
+
+    elif isinstance(tree, ast.Tuple):
+        elts = tree.elts
+        return PythonType(("<Tuple>",), tuple(map(parse_type_from_ast, elts)))
+
+    else:
+        raise SyntaxError(
+            f"Unsupported ast type: {ast.dump(tree, include_attributes=True)}"
+        )
 
 
-def parse_qualified_name(tree: ast.Attribute | ast.Name):
+def parse_qualified_name(tree: Union[ast.Attribute, ast.Name]):
     segs = []
     while isinstance(tree, ast.Attribute):
         segs.append(tree.attr)
@@ -281,7 +296,6 @@ class MypyResult:
 
 
 class MypyChecker:
-
     TypeCheckFlags = [
         "--follow-imports=skip",
         "--namespace-packages",
@@ -308,7 +322,7 @@ class MypyChecker:
     MypyErrorCodesToIgnore = {"valid-type"}
 
     @staticmethod
-    def check_project(proj: Path, binary_path: Path | None = None) -> MypyResult | str:
+    def check_project(proj: Path, binary_path: Optional[Path] = None) -> Union[MypyResult, str]:
         if binary_path is None:
             binary_path = proj_root() / ".venv/bin"
         binary_path = binary_path.resolve()
@@ -328,8 +342,8 @@ class MypyChecker:
 
     @staticmethod
     def check_code(
-        code: str, cwd: Optional[Path] = None, mypy_path: Path | None = None
-    ) -> MypyResult | str:
+        code: str, cwd: Optional[Path] = None, mypy_path: Optional[Path] = None
+    ) -> Union[MypyResult, str]:
         "Treat code as a single-file project and performs the type checking."
         if mypy_path is None:
             mypy_path = proj_root() / ".venv/bin/mypy"
@@ -362,7 +376,7 @@ class MypyChecker:
         output: subprocess.CompletedProcess[str],
         cmd: list,
         cwd: Path,
-    ) -> MypyResult | str:
+    ) -> Union[MypyResult, str]:
         lines = output.stdout.splitlines()
         if len(lines) == 0:
             return f"mypy failed. Command: `{' '.join(map(str, cmd))}` in cwd='{cwd}'\nError: {output.stderr}"
@@ -431,7 +445,7 @@ class IncrementalChekcer:
             capture_output=True,
         )
 
-    def recheck_files(self, *updated_files: Path) -> MypyResult | str:
+    def recheck_files(self, *updated_files: Path) -> Union[MypyResult, str]:
         # TODO: remove this workaround once (https://github.com/python/mypy/issues/12697) is fixed.
         time.sleep(
             self.wait_before_check
@@ -468,7 +482,7 @@ class IncrementalChekcer:
         assert isinstance(out, MypyResult), f"Recheck failed: {out}"
         return out
 
-    def _run_mypy(self, cmd: list[str]) -> MypyResult | str:
+    def _run_mypy(self, cmd: list[str]) -> Union[MypyResult, str]:
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -480,7 +494,7 @@ class IncrementalChekcer:
 
 
 @contextmanager
-def mypy_checker(code_dir: Path, dmypy_path: Path | None = None, wait_before_check=1.0):
+def mypy_checker(code_dir: Path, dmypy_path: Optional[Path] = None, wait_before_check=1.0):
     checker = None
     try:
         if dmypy_path is None:
