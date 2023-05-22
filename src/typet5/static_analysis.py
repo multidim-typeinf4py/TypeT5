@@ -1516,7 +1516,9 @@ class UsageRecorder(cst.CSTVisitor):
 
     def _resolve(self, name: cst.CSTNode):
         if is_access_chain(name) and name in self.name_mapping:
-            srcs = self.name_mapping[name]
+            if isinstance(srcs := self.name_mapping[name], LazyValue):
+                srcs: Collection[QualifiedName] = srcs()
+
             if len(srcs) == 0 and isinstance(name, cst.Name):
                 # unresolved symbols are put into the 'LOCAL' category for later processing
                 # due to star imports.
