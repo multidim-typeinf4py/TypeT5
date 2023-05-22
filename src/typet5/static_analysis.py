@@ -6,6 +6,7 @@ import enum
 from functools import cache, cached_property, lru_cache
 
 from libcst import MetadataWrapper
+from libcst._metadata_dependent import LazyValue
 from libcst.metadata import (
     CodeRange,
     PositionProvider,
@@ -1129,7 +1130,9 @@ class ModuleAnlaysis:
             cls.superclasses = list()
             for b in cls.tree.bases:
                 if b.value in self.node2qnames and self.node2qnames[b.value]:
-                    cls.superclasses.extend(self.node2qnames[b.value])
+                    if isinstance(qnames := self.node2qnames[b.value], LazyValue):
+                        qnames: Collection[QualifiedName] = qnames()
+                    cls.superclasses.extend(qnames)
                 elif isinstance(b.value, cst.Name):
                     # unresovled parent class is treated as local for later processing
                     cls.superclasses.append(
