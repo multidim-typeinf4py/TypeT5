@@ -6,7 +6,6 @@ import enum
 from functools import cache, cached_property, lru_cache
 
 from libcst import MetadataWrapper
-from libcst._metadata_dependent import LazyValue
 from libcst.metadata import (
     CodeRange,
     PositionProvider,
@@ -1081,7 +1080,7 @@ class ModuleAnlaysis:
         self.module = mod
         wrapper = cst.MetadataWrapper(mod.tree, unsafe_skip_copy=True)
         # below need to be dict to be pickleable
-        self.node2qnames = dict(wrapper.resolve(QualifiedNameProvider))
+        self.node2qnames = {k: v() for k, v in wrapper.resolve(QualifiedNameProvider).items()}
         self.node2pos = dict(wrapper.resolve(PositionProvider))
 
     def compute_module_usages(self):
@@ -1097,8 +1096,7 @@ class ModuleAnlaysis:
             match e:
                 case PythonFunction():
                     e.tree.visit(recorder)
-                    if isinstance(self_names := self.node2qnames[e.tree.name], LazyValue):
-                        self_names = self_names()
+                    self_names = self.node2qnames[e.tree.name]
 
                     # generate fixture usages
                     if e.is_fixture_user:
@@ -1131,8 +1129,7 @@ class ModuleAnlaysis:
             cls.superclasses = list()
             for b in cls.tree.bases:
                 if b.value in self.node2qnames and self.node2qnames[b.value]:
-                    if isinstance(qnames := self.node2qnames[b.value], LazyValue):
-                        qnames: Collection[QualifiedName] = qnames()
+                    qnames = self.node2qnames[b.value]
                     cls.superclasses.extend(qnames)
                 elif isinstance(b.value, cst.Name):
                     # unresovled parent class is treated as local for later processing
@@ -1517,8 +1514,7 @@ class UsageRecorder(cst.CSTVisitor):
 
     def _resolve(self, name: cst.CSTNode):
         if is_access_chain(name) and name in self.name_mapping:
-            if isinstance(srcs := self.name_mapping[name], LazyValue):
-                srcs: Collection[QualifiedName] = srcs()
+            srcs = self.name_mapping[name]
 
             if len(srcs) == 0 and isinstance(name, cst.Name):
                 # unresolved symbols are put into the 'LOCAL' category for later processing
