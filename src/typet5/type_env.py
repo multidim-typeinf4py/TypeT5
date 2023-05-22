@@ -3,9 +3,7 @@ import time
 from dataclasses import dataclass, field
 from posixpath import dirname, realpath
 from typing import *
-from typing import Union, Optional
 
-import libcst as cst
 from libcst.metadata import CodeRange, PositionProvider
 from pyrsistent import plist
 from pyrsistent.typing import PList
@@ -64,7 +62,7 @@ class AnnotInfo:
         return f"AnnotInfo({str(self.path)}, {self.cat.name}, range={self.annot_range}, expr={expr})"
 
 
-def collect_annots_info(code: Union[cst.Module, cst.MetadataWrapper]) -> list[AnnotInfo]:
+def collect_annots_info(code: cst.Module | cst.MetadataWrapper) -> list[AnnotInfo]:
     """Collect all AnnotInfo in the given source code.
     Note: the order of the paths are not guaranteed to follow the order of the source code.
     Check the `annot_range` of the returned AnnotInfo to get the correct order."""
@@ -76,7 +74,7 @@ def collect_annots_info(code: Union[cst.Module, cst.MetadataWrapper]) -> list[An
 
 
 def collect_user_annotations(
-    code: Union[cst.Module, cst.MetadataWrapper],
+    code: cst.Module | cst.MetadataWrapper,
 ) -> tuple[list[AnnotInfo], list["PythonType"]]:
     """Collect all user-added type annotations in the given source code. Unlike `collect_annots_info`,
     The order of the returned annotations is guaranteed to follow the order of the source code."""
@@ -138,16 +136,18 @@ class CodePathManager:
         return self.path.append(name, id)
 
     def on_visit(self, node):
-        if isinstance(node, cst.FunctionDef):
-            self.path = self.get_path(node.name.value)
-        if isinstance(node, cst.ClassDef):
-            self.path = self.get_path(node.name.value)
-        if isinstance(node, cst.Lambda):
-            self.path = self.get_path(SpecialNames.Lambda)
+        match node:
+            case cst.FunctionDef():
+                self.path = self.get_path(node.name.value)
+            case cst.ClassDef():
+                self.path = self.get_path(node.name.value)
+            case cst.Lambda():
+                self.path = self.get_path(SpecialNames.Lambda)
 
     def on_leave(self, node):
-        if isinstance(node, (cst.ClassDef, cst.FunctionDef, cst.Lambda)):
-            self.path = self.path.pop()
+        match node:
+            case cst.ClassDef() | cst.FunctionDef() | cst.Lambda():
+                self.path = self.path.pop()
 
 
 class AnnotCollector(cst.CSTVisitor):
@@ -162,17 +162,18 @@ class AnnotCollector(cst.CSTVisitor):
 
     def on_visit(self, node):
         self.pm.on_visit(node)
-        if isinstance(node, (cst.FunctionDef, cst.Lambda)):
-            self.cat_stack.append(AnnotCat.LocalVar)
-        elif isinstance(node, cst.ClassDef):
-            self.cat_stack.append(AnnotCat.ClassAtribute)
+        match node:
+            case cst.FunctionDef() | cst.Lambda():
+                self.cat_stack.append(AnnotCat.LocalVar)
+            case cst.ClassDef():
+                self.cat_stack.append(AnnotCat.ClassAtribute)
         return super().on_visit(node)
 
     def on_leave(self, node):
         r = super().on_leave(node)
-        if isinstance(node, (cst.ClassDef, cst.FunctionDef, cst.Lambda)):
-            self.cat_stack.pop()
-
+        match node:
+            case cst.ClassDef() | cst.FunctionDef() | cst.Lambda():
+                self.cat_stack.pop()
         self.pm.on_leave(node)
         return r
 
@@ -180,7 +181,7 @@ class AnnotCollector(cst.CSTVisitor):
         self,
         name: str,
         cat: AnnotCat,
-        annot: Optional[cst.Annotation],
+        annot: cst.Annotation | None,
     ) -> None:
         path = self.pm.get_path(name)
         crange = None
@@ -197,12 +198,11 @@ class AnnotCollector(cst.CSTVisitor):
             self._record_annot(name, AnnotCat.FuncArg, node.annotation)
 
     def visit_AnnAssign(self, node: cst.AnnAssign):
-        if isinstance(node.target, cst.Name):
-            self._record_annot(node.target.value, self.cat_stack[-1], node.annotation)
-        elif isinstance(node.target, cst.Attribute) and isinstance(node.target.value, cst.Name) and isinstance(node.target.attr, cst.Name):
-            l = node.target.value.value
-            r = node.target.attr.value
-            self._record_annot(l + "." + r, AnnotCat.ClassAtribute, node.annotation)
+        match node.target:
+            case cst.Name(value=name):
+                self._record_annot(name, self.cat_stack[-1], node.annotation)
+            case cst.Attribute(value=cst.Name(value=l), attr=cst.Name(value=r)):
+                self._record_annot(l + "." + r, AnnotCat.ClassAtribute, node.annotation)
 
 
 def fix_code_pos(pos: CodePosition):
@@ -259,17 +259,13 @@ class AnnotApplier(cst.CSTTransformer):
     def leave_AnnAssign(
         self, node: cst.AnnAssign, updated: cst.AnnAssign
     ) -> cst.AnnAssign:
-        if isinstance(updated.target, cst.Name):
-            key_name = updated.target.value
-
-        elif isinstance(updated.target, cst.Attribute) and isinstance(updated.target.value, cst.Name) and isinstance(updated.target.attr, cst.Name):
-            l = updated.target.value.name
-            r = updated.target.attr.name
-            key_name = f"{l}.{r}"
-
-        else:
-            key_name = SpecialNames.Missing
-
+        match updated.target:
+            case cst.Name(value=name):
+                key_name = name
+            case cst.Attribute(value=cst.Name(value=l), attr=cst.Name(value=r)):
+                key_name = l + "." + r
+            case _:
+                key_name = SpecialNames.Missing
         path = self.pm.get_path(key_name)
 
         if path in self.annots:
@@ -326,7 +322,7 @@ class AccuracyMetric:
     filter_none_any: bool = True
     match_base_only: bool = False
     ignore_namespace: bool = True
-    ast_depth_limit: Optional[int] = None
+    ast_depth_limit: int | None = None
     filter_rare: bool = (
         False  # when filter_rare=True and keep_rare=False, only common types are kept
     )
@@ -363,7 +359,7 @@ class AccuracyMetric:
 
     @staticmethod
     def default_metrics(
-        common_type_names: set[str], ast_depth_limit: Optional[int] = None
+        common_type_names: set[str], ast_depth_limit: int | None = None
     ):
         return [
             AccuracyMetric(
@@ -439,7 +435,7 @@ def type_accuracies(
     types_cat: Sequence[AnnotCat],
     metric: AccuracyMetric,
     crash_on_type_mask=True,
-    output_incorrect_set: Optional[list[int]] = None,
+    output_incorrect_set: list[int] | None = None,
 ) -> dict[str, Any]:
     assert_eq(len(pred_types), len(label_types), len(types_cat))
 
