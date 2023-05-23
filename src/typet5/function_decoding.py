@@ -193,20 +193,8 @@ class RolloutCtx:
         pre_args: PreprocessArgs,
         decode_order: "DecodingOrder",
         concurrency: int = DefaultWorkers,
+        num_return_sequences: int | None = None,
     ):
-        sigmap = dict[ProjectPath, ElemSignature]()
-
-        def callback(e: PythonElem, types, sig: ElemSignature) -> None:
-            if e.path not in sigmap:
-                sigmap[e.path] = sig
-                print(f"{e.path}: {str(sig)}")
-            else:
-                old_sig = sigmap[e.path]
-                corrected = str(old_sig) != str(sig)
-                sigmap[e.path] = sig
-                if corrected:
-                    print(f"(updated) {e.path}: {str(sig)}")
-
         with ThreadPoolExecutor(1) as model_executor, ProcessPoolExecutor(
             concurrency
         ) as cpu_executor:
@@ -217,7 +205,7 @@ class RolloutCtx:
                 cpu_executor=cpu_executor,
                 model_executor=model_executor,
                 oracle=None,
-                progress_cbk=callback,
+                num_return_sequences=num_return_sequences
             )
 
     async def project_rollout(
@@ -231,6 +219,7 @@ class RolloutCtx:
         progress_cbk: Callable[
             [PythonElem, Sequence[PythonType], ElemSignature], Any
         ] = lambda x, y, z: None,
+        num_return_sequences: int | None = None,
     ) -> RolloutPrediction:
         """Note: when evaluating on dataset with ground truth labels, we need to
         first replace all labels with `SpecialNames.TypeMask` before feeding to
@@ -328,7 +317,7 @@ class RolloutCtx:
                         "n_labels": torch.tensor([chunk["n_labels"]]),
                     }
                     preds, _ = await eloop.run_in_executor(
-                        model_executor, self.model.predict_on_batch, chunk
+                        model_executor, self.model.predict_on_batch, chunk, num_return_sequences
                     )
                     pred_types.extend(preds[0])
                 elem2inputs[elem.path] = model_inputs[0]
