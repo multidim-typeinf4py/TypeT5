@@ -1,6 +1,6 @@
 # -----------------------------------------------------------
 # project-level static analysis
-
+import collections
 import copy
 import enum
 from functools import cache, cached_property, lru_cache
@@ -368,6 +368,7 @@ class FunctionSignature:
 
 ElemSignature = VariableSignature | FunctionSignature
 SignatureMap = dict[ProjectPath, ElemSignature]
+SignatureMapTopN = collections.defaultdict[ProjectPath, list[ElemSignature]]
 
 
 def reorder_signature_map(

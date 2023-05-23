@@ -27,11 +27,12 @@ from .static_analysis import (
     SignatureErrorAnalysis,
     UsageAnalysis,
     VariableSignature,
-    reorder_signature_map,
+    reorder_signature_map, SignatureMapTopN,
 )
 from .tokenized_src import PreprocessArgs, TokenSeq, tokenized_src_from_segs
 from .type_check import PythonType, parse_type_str
 from .type_env import AccuracyMetric, AnnotPath, collect_user_annotations
+import libcst
 from .utils import *
 
 
@@ -63,6 +64,11 @@ class RolloutPrediction:
             return self.pred_assignments
         else:
             return self.assignments
+
+
+@dataclass
+class RolloutPredictionTopN:
+    final_sigmap: SignatureMapTopN
 
 
 @dataclass
@@ -194,17 +200,16 @@ class RolloutCtx:
         decode_order: "DecodingOrder",
         concurrency: int = DefaultWorkers,
         num_return_sequences: int | None = None,
-    ):
+    ) -> RolloutPredictionTopN:
         with ThreadPoolExecutor(1) as model_executor, ProcessPoolExecutor(
             concurrency
         ) as cpu_executor:
-            return await self.project_rollout(
+            return await self.project_rollout_topn(
                 project,
                 pre_args,
                 decode_order,
                 cpu_executor=cpu_executor,
                 model_executor=model_executor,
-                oracle=None,
                 num_return_sequences=num_return_sequences
             )
 
@@ -219,7 +224,6 @@ class RolloutCtx:
         progress_cbk: Callable[
             [PythonElem, Sequence[PythonType], ElemSignature], Any
         ] = lambda x, y, z: None,
-        num_return_sequences: int | None = None,
     ) -> RolloutPrediction:
         """Note: when evaluating on dataset with ground truth labels, we need to
         first replace all labels with `SpecialNames.TypeMask` before feeding to
@@ -246,7 +250,7 @@ class RolloutCtx:
         final_sigmap = SignatureMap()
         elem2preds = dict[ProjectPath, Sequence[PythonType]]()
         elem2inputs = dict[ProjectPath, dict]()
-        mask_annot = cst.Annotation(cst.Name(SpecialNames.TypeMask))
+        mask_annot = libcst.Annotation(libcst.Name(SpecialNames.TypeMask))
 
         # Parallelize computation between dependency-free elements
         for elem in to_visit:
@@ -299,7 +303,7 @@ class RolloutCtx:
             model_inputs = await eloop.run_in_executor(
                 cpu_executor,
                 construct_model_inputs,
-                cst.Module(main_lines),
+                libcst.Module(main_lines),
                 left_m,
                 right_m,
                 preamble,
@@ -310,6 +314,7 @@ class RolloutCtx:
             pred_types = list[PythonType]()
             new_sig = copy.deepcopy(sig)
             if model_inputs:
+                elem2inputs[elem.path] = model_inputs[0]
                 for chunk in model_inputs:
                     chunk = {
                         "input_ids": torch.tensor([chunk["input_ids"]]),
@@ -317,10 +322,9 @@ class RolloutCtx:
                         "n_labels": torch.tensor([chunk["n_labels"]]),
                     }
                     preds, _ = await eloop.run_in_executor(
-                        model_executor, self.model.predict_on_batch, chunk, num_return_sequences
+                        model_executor, self.model.predict_on_batch, chunk
                     )
                     pred_types.extend(preds[0])
-                elem2inputs[elem.path] = model_inputs[0]
 
                 # update the signature with the predicted types
                 if isinstance(new_sig, VariableSignature):
@@ -328,20 +332,20 @@ class RolloutCtx:
                         new_sig.annot
                     ), f"For {elem}, sig={new_sig}"
                     assert_eq(len(pred_types), 1)
-                    new_sig.annot = cst.Annotation(
-                        cst.parse_expression(str(pred_types[0]))
+                    new_sig.annot = libcst.Annotation(
+                        libcst.parse_expression(str(pred_types[0]))
                     )
                 elif isinstance(elem, PythonFunction):
                     # assert len(pred_types) >= len(sig.params) + 1
                     n_pred = 0
                     for (n, a) in new_sig.params.items():
                         if a is None or is_mask_annot(a):
-                            new_type = cst.parse_expression(str(pred_types[n_pred]))
-                            new_sig.params[n] = cst.Annotation(new_type)
+                            new_type = libcst.parse_expression(str(pred_types[n_pred]))
+                            new_sig.params[n] = libcst.Annotation(new_type)
                             n_pred += 1
                     if new_sig.returns is None or is_mask_annot(new_sig.returns):
-                        new_sig.returns = cst.Annotation(
-                            cst.parse_expression(str(pred_types[n_pred]))
+                        new_sig.returns = libcst.Annotation(
+                            libcst.parse_expression(str(pred_types[n_pred]))
                         )
                 pred_sigmap[elem.path] = new_sig
             if (
@@ -357,10 +361,154 @@ class RolloutCtx:
 
         return RolloutPrediction(final_sigmap, elem2preds, elem2inputs, pred_sigmap)
 
+    async def project_rollout_topn(
+        self,
+        project: PythonProject,
+        pre_args: PreprocessArgs,
+        decode_order: "DecodingOrder",
+        cpu_executor: ProcessPoolExecutor,
+        model_executor: ThreadPoolExecutor,
+        progress_cbk: Callable[
+            [PythonElem, Sequence[PythonType], ElemSignature], Any
+        ] = lambda x, y, z: None,
+        num_return_sequences: int | None = None,
+    ) -> RolloutPredictionTopN:
+        """Note: when evaluating on dataset with ground truth labels, we need to
+        first replace all labels with `SpecialNames.TypeMask` before feeding to
+        this function.
+        """
+        # Model executor needs to be single threaded.
+        assert_eq(model_executor._max_workers, 1)
 
-def is_mask_annot(a: cst.Annotation) -> bool:
+        eloop = asyncio.get_event_loop()
+        analysis: UsageAnalysis = await eloop.run_in_executor(
+            cpu_executor,
+            UsageAnalysis,
+            project,
+            pre_args.add_override_usages,
+            pre_args.add_implicit_rel_imports,
+        )
+        to_visit = [analysis.path2elem[p] for p in decode_order.traverse(analysis)]
+        visit_set = {e.path for e in to_visit}
+        for e in project.all_elems():
+            assert e.path in visit_set, f"{e.path} not in the decoder order."
+        preamble_cache = dict[ModuleName, tuple[str, TokenSeq]]()
+
+        final_sigmap = SignatureMapTopN(list)
+        mask_annot = libcst.Annotation(libcst.Name(SpecialNames.TypeMask))
+
+        # Parallelize computation between dependency-free elements
+        for elem in to_visit:
+            # construct input for the model
+            # first, create or retrieve the preamble
+            cur_module = elem.path.module
+            if cur_module not in preamble_cache:
+                preamble_tuple = await eloop.run_in_executor(
+                    cpu_executor,
+                    mk_preamble,
+                    project.modules[cur_module].tree,
+                    pre_args,
+                )
+                preamble_cache[cur_module] = preamble_tuple
+            preamble, tokenized_preamble = preamble_cache[cur_module]
+
+            # then, make all missing types in the signature a prediction target
+            if isinstance(elem, PythonVariable):
+                sig = elem.get_signature()
+                elem_sig = copy.deepcopy(sig)
+                if sig.annot is None:
+                    elem_sig.annot = mask_annot
+                elem_map = {elem.path: elem_sig}
+            elif isinstance(elem, PythonFunction):
+                sig = elem.get_signature()
+                elem_sig = copy.deepcopy(sig)
+                for n, a in elem_sig.params.items():
+                    if a is None:
+                        elem_sig.params[n] = mask_annot
+                if elem_sig.returns is None:
+                    elem_sig.returns = mask_annot
+                elem_map = {elem.path: elem_sig}
+            else:
+                raise NotImplemented(f"Unsupported element type {type(elem)}")
+            # inline the type signatures using `reformat_elems`
+            main_lines = reformat_elems(
+                [elem],
+                analysis.path2class,
+                cast(SignatureMap, elem_map),
+                keep_body_types=True,
+            )
+
+            left_m, right_m = ctx_modules_for_elem(
+                elem,
+                analysis,
+                pre_args,
+                final_sigmap if decode_order.types_in_ctx() else {},
+            )
+
+            sig_preds = list[list[PythonType]]()
+            model_inputs = await eloop.run_in_executor(
+                cpu_executor,
+                construct_model_inputs,
+                libcst.Module(main_lines),
+                left_m,
+                right_m,
+                preamble,
+                tokenized_preamble,
+                self.model.args.ctx_args,
+            )
+
+            for chunk in model_inputs:
+                chunk = {
+                    "input_ids": torch.tensor([chunk["input_ids"]]),
+                    "labels": torch.tensor([chunk["labels"]]),
+                    "n_labels": torch.tensor([chunk["n_labels"]]),
+                }
+                preds, _ = await eloop.run_in_executor(
+                    model_executor, self.model.predict_on_batch, chunk, num_return_sequences
+                )
+                sig_preds.extend(preds)
+
+            # update the signature with the predicted types
+            if isinstance(sig, VariableSignature):
+                assert sig.annot is None or is_mask_annot(
+                    sig.annot
+                ), f"For {elem}, sig={sig}"
+
+                for sig_pred in sig_preds:
+                    assert_eq(len(sig_pred), 1)
+                    new_sig = copy.deepcopy(sig)
+                    new_sig.annot = libcst.Annotation(
+                        libcst.parse_expression(str(sig_pred[0]))
+                    )
+
+                    final_sigmap[elem.path].append(new_sig)
+
+            elif isinstance(sig, FunctionSignature):
+                # assert len(sig_preds) >= len(sig.params) + 1
+
+                for sig_pred in sig_preds:
+                    new_sig = copy.deepcopy(sig)
+
+                    n_pred = 0
+                    for n, a in sig.params.items():
+                        if a is None or is_mask_annot(a):
+                            new_type = libcst.parse_expression(str(sig_pred[n_pred]))
+                            new_sig.params[n] = libcst.Annotation(new_type)
+                            n_pred += 1
+                    if new_sig.returns is None or is_mask_annot(new_sig.returns):
+                        new_sig.returns = libcst.Annotation(
+                            libcst.parse_expression(str(sig_pred[n_pred]))
+                        )
+                    final_sigmap[elem.path].append(new_sig)
+
+            else:
+                assert not isinstance(sig, FunctionSignature | VariableSignature), f"Unknown signature type: {type(sig)=}"
+
+        return RolloutPredictionTopN(final_sigmap=final_sigmap)
+
+def is_mask_annot(a: libcst.Annotation) -> bool:
     match a.annotation:
-        case cst.Name(value=SpecialNames.TypeMask):
+        case libcst.Name(value=SpecialNames.TypeMask):
             return True
     return False
 
@@ -469,9 +617,9 @@ class DecodingOrders:
 
 
 def construct_model_inputs(
-    main_mod: cst.Module,
-    left_m: cst.Module | None,
-    right_m: cst.Module | None,
+    main_mod: libcst.Module,
+    left_m: libcst.Module | None,
+    right_m: libcst.Module | None,
     preamble: str,
     preamble_tkns: TokenSeq,
     ctx_args: CtxArgs,
