@@ -399,6 +399,8 @@ class RolloutCtx:
 
         # Parallelize computation between dependency-free elements
         for elem in to_visit:
+            if elem.path in final_sigmap:
+                continue
             # construct input for the model
             # first, create or retrieve the preamble
             cur_module = elem.path.module
@@ -445,7 +447,6 @@ class RolloutCtx:
                 final_sigmap if decode_order.types_in_ctx() else {},
             )
 
-            sig_preds = list[list[PythonType]]()
             model_inputs = await eloop.run_in_executor(
                 cpu_executor,
                 construct_model_inputs,
@@ -457,6 +458,7 @@ class RolloutCtx:
                 self.model.args.ctx_args,
             )
 
+            sig_preds = list[list[PythonType]]()
             for chunk in model_inputs:
                 chunk = {
                     "input_ids": torch.tensor([chunk["input_ids"]]),
@@ -469,6 +471,7 @@ class RolloutCtx:
                 sig_preds.extend(preds)
 
             # update the signature with the predicted types
+            print()
             if isinstance(sig, VariableSignature):
                 assert sig.annot is None or is_mask_annot(
                     sig.annot
