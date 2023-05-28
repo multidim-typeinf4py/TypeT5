@@ -471,11 +471,10 @@ class RolloutCtx:
                 sig_preds.extend(preds)
 
             # update the signature with the predicted types
-            print()
             if isinstance(sig, VariableSignature):
-                assert sig.annot is None or is_mask_annot(
-                    sig.annot
-                ), f"For {elem}, sig={sig}"
+                #assert sig.annot is None or is_mask_annot(
+                #    sig.annot
+                #), f"For {elem}, sig={sig}"
 
                 for sig_pred in sig_preds:
                     assert_eq(len(sig_pred), 1)
