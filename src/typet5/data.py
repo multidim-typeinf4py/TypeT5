@@ -110,7 +110,7 @@ class GitRepo:
             paths = collect_annots_info(m)
             path_to_cat = {pinfo.path: pinfo.cat for pinfo in paths}
             n_paths += len(paths)
-            annots = (info for info in paths if info.annot is not None)
+            annots = list(info for info in paths if info.annot is not None)
             n_annots += sum(1 for _ in annots)
             file_to_annots[rpath] = {
                 (k := info.path): (
