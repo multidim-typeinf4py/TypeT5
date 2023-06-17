@@ -53,7 +53,7 @@ def remove_newer_syntax(m: cst.Module, supported: SupportedSyntax) -> cst.Module
                 return updated
             ty = parse_type_expr(updated.annotation, silent=True)
             if ty is None:
-                return cst.RemoveFromParent()
+                return updated
             ty = normalize_type(ty)  # this should get rid of the Union type syntax.
             return updated.with_changes(annotation=cst.parse_expression(str(ty)))
 
