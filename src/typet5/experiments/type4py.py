@@ -26,28 +26,28 @@ class Type4PyResponseParser:
         self.assignment = dict()
         res = res_json["response"]
 
-        for name, pred in res["variables_p"].items():
+        for name, pred in res.get("variables_p", {}).items():
             annot = self.parse_prediction(pred)
             sig = VariableSignature(annot, in_class=False)
             self.assignment[ProjectPath(self.module, name)] = sig
-        for f in res["funcs"]:
+        for f in res.get("funcs", {}):
             self._parse_func(
                 f,
                 ProjectPath(self.module, ""),
                 in_class=False,
             )
-        for c in res["classes"]:
+        for c in res.get("classes", {}):
             self._parse_cls(c, ProjectPath(self.module, ""))
         return self.assignment
 
     def _parse_cls(self, cls_json: dict, base: ProjectPath):
-        attr_preds: dict[str, PredList] = cls_json["variables_p"]
         new_base = base.append(cls_json["name"])
+        attr_preds: dict[str, PredList] = cls_json.get("variables_p", {})
         for name, pred in attr_preds.items():
             annot = self.parse_prediction(pred)
             sig = VariableSignature(annot, in_class=True)
             self.assignment[new_base.append(name)] = sig
-        for func_json in cls_json["funcs"]:
+        for func_json in cls_json.get("funcs", {}):
             try:
                 self._parse_func(func_json, new_base, in_class=True)
             except:
