@@ -107,7 +107,7 @@ class ModelWrapper:
         self,
         batch: dict,
         num_return_sequences: int | None = None,
-    ) -> tuple[list[list[PythonType]], Tensor]:
+    ) -> tuple[list[list[PythonType]], Tensor, list[float]]:
         """Run the model on the given batch and return the predicted types for each row."""
         model = self.model
         args = self.args
@@ -120,7 +120,7 @@ class ModelWrapper:
                 div_pen is not None and div_pen > 0
             ), "num_beam_groups requires diversity_penalty > 0"
 
-        output_ids = model.generate(
+        output: BeamSearchEncoderDecoderOutput = model.generate(
             inputs=batch["input_ids"].to(model.device),
             do_sample=args.do_sample,
             top_p=args.top_p,
@@ -131,7 +131,12 @@ class ModelWrapper:
             diversity_penalty=div_pen,
             length_penalty=args.length_penalty,
             renormalize_logits=True,
-        ).cpu()  # type: ignore
+            return_dict_in_generate=True,
+            output_scores=True,
+        )  # type: ignore
+
+        output_ids = output.sequences.cpu()
+        scores = output.sequences_scores.cpu()
         assert len(output_ids.shape) == 2
 
         def decode_row(row, n_labels) -> list[PythonType]:
@@ -146,7 +151,9 @@ class ModelWrapper:
             decode_row(output_ids[i, :], n_labels[i // num_return_sequences])
             for i in range(n_rows)
         ]
-        return types, output_ids
+        scs = scores.tolist()
+
+        return types, output_ids, scs
 
     @overload
     def predict(

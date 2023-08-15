@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import math
 import random
 import warnings
 
@@ -53,6 +54,7 @@ class RolloutPrediction:
     elem2preds: dict[ProjectPath, Sequence[PythonType]]
     elem2inputs: dict[ProjectPath, dict]
     pred_assignments: SignatureMap = field(default_factory=SignatureMap)
+    logit_scores: dict[ProjectPath, float] = field(default_factory=dict)
 
     @property
     def final_sigmap(self) -> SignatureMap:
@@ -247,6 +249,7 @@ class RolloutCtx:
         preamble_cache = dict[ModuleName, tuple[str, TokenSeq]]()
 
         pred_sigmap = SignatureMap()
+        pred_logits = dict[ProjectPath, list[float]]()
         final_sigmap = SignatureMap()
         elem2preds = dict[ProjectPath, Sequence[PythonType]]()
         elem2inputs = dict[ProjectPath, dict]()
@@ -312,6 +315,7 @@ class RolloutCtx:
             )
 
             pred_types = list[PythonType]()
+            pred_scores = list[float]()
             new_sig = copy.deepcopy(sig)
             if model_inputs:
                 elem2inputs[elem.path] = model_inputs[0]
@@ -321,12 +325,14 @@ class RolloutCtx:
                         "labels": torch.tensor([chunk["labels"]]),
                         "n_labels": torch.tensor([chunk["n_labels"]]),
                     }
-                    preds, _ = await eloop.run_in_executor(
+                    preds, _, scores = await eloop.run_in_executor(
                         model_executor, self.model.predict_on_batch, chunk
                     )
                     pred_types.extend(preds[0])
+                    pred_scores.extend(scores)
 
                 # update the signature with the predicted types
+                assert len(pred_scores) == 1
                 if isinstance(new_sig, VariableSignature):
                     assert new_sig.annot is None or is_mask_annot(
                         new_sig.annot
@@ -335,9 +341,12 @@ class RolloutCtx:
                     new_sig.annot = libcst.Annotation(
                         libcst.parse_expression(str(pred_types[0]))
                     )
+
+
                 elif isinstance(elem, PythonFunction):
                     # assert len(pred_types) >= len(sig.params) + 1
                     n_pred = 0
+
                     for (n, a) in new_sig.params.items():
                         if a is None or is_mask_annot(a):
                             new_type = libcst.parse_expression(str(pred_types[n_pred]))
@@ -347,7 +356,9 @@ class RolloutCtx:
                         new_sig.returns = libcst.Annotation(
                             libcst.parse_expression(str(pred_types[n_pred]))
                         )
+
                 pred_sigmap[elem.path] = new_sig
+                pred_logits[elem.path] = pred_scores[0]
             if (
                 oracle is not None
                 and (label := oracle.get(elem.path)) is not None
@@ -359,7 +370,7 @@ class RolloutCtx:
             if model_inputs:
                 progress_cbk(elem, pred_types, new_sig)
 
-        return RolloutPrediction(final_sigmap, elem2preds, elem2inputs, pred_sigmap)
+        return RolloutPrediction(final_sigmap, elem2preds, elem2inputs, pred_sigmap, pred_logits)
 
     async def project_rollout_topn(
         self,
